@@ -29,8 +29,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import pandas as pd
-import torch
 
 # =============================================================================
 # Classes open-vocabulary (otimizadas sem viés de "dolphin fish" em tubarões)
@@ -197,12 +195,14 @@ def _classify_crop_via_fishid_api(api_base: str, crop_path: Path) -> tuple[str, 
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        top = data.get("top_prediction") or {}
-        name = top.get("display_name") or top.get("common_pt") or top.get("species")
-        conf = float(top.get("confidence", 0.0))
+        name = data.get("display_name") or data.get("top_species") or data.get("scientific_name")
+        conf = float(data.get("confidence", 0.0))
         if name:
             return str(name), round(conf, 4)
-    except Exception:
+    except OSError as exc:
+        detail = " ".join(str(exc).splitlines())
+        print(f"[WARN] Falha ao consultar a API FishID: {detail}")
+    except (AttributeError, TypeError, ValueError):
         return None
     return None
 
@@ -579,7 +579,6 @@ def save_audit_card(
         f"Individuo #{event_id} | Classe: {fish_label} ({label_conf*100:.0f}%) | "
         f"Tamanho medio: {size_str} | Frame {frame_idx} ({_fmt_hms(tempo_s)})"
     )
-    tids_txt = ",".join(f"#{t}" for t in track_ids[:6]) + ("..." if len(track_ids) > 6 else "")
     sub = (
         f"Curva frame: {meas['comprimento_curva_px']:.1f} px | Eixo: {meas['comprimento_eixo_px']:.1f} px | "
         f"Aspecto: {meas['razao_aspecto']:.2f} | Oclusao: {person_overlap*100:.0f}%"
@@ -693,6 +692,8 @@ def render_hud_video(
 
 
 def run_experiment(args: argparse.Namespace) -> Path:
+    import pandas as pd
+    import torch
     from ultralytics import SAM, YOLO
 
     t0 = time.perf_counter()
