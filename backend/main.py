@@ -11,9 +11,10 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageOps
+from starlette.concurrency import run_in_threadpool
 
-from storage import get_storage_config, save_contribution, validate_image_quality
+from storage import get_contribution_stats, get_storage_config, save_contribution, validate_image_quality
 
 # =============================================================================
 # Configurações editáveis do Backend (API Keras - FishID Studio)
@@ -22,6 +23,8 @@ MODEL_PATH: str = os.getenv("MODEL_PATH", "models/modelo.keras").strip()
 NORMALIZE_DIV_255: bool = os.getenv("NORMALIZE_DIV_255", "true").lower() == "true"
 PRESERVE_ASPECT_RATIO: bool = os.getenv("PRESERVE_ASPECT_RATIO", "true").lower() == "true"
 DEFAULT_INPUT_SIZE: tuple[int, int] = (320, 320)
+MAX_BATCH_FILES = 32
+MAX_BATCH_FILE_BYTES = 15 * 1024 * 1024
 
 # Catálogo oficial das 10 espécies em ordem alfabética (mesma ordem do class_indices.json)
 SPECIES_CATALOG: list[dict[str, str]] = [
@@ -298,21 +301,43 @@ def model_info() -> dict[str, Any]:
     }
 
 
+async def _read_image(file: UploadFile, max_bytes: int = -1) -> Image.Image:
+    raw_bytes = await file.read(max_bytes + 1 if max_bytes >= 0 else -1)
+    if 0 <= max_bytes < len(raw_bytes):
+        raise HTTPException(status_code=413, detail="Cada arquivo pode ter no máximo 15 MiB.")
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as image:
+            return ImageOps.exif_transpose(image).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Imagem inválida: {exc}") from exc
+
+
 @app.post("/predict")
 async def predict_endpoint(
     file: UploadFile = File(...),
     hint_species: str | None = Form(default=None),
 ) -> dict[str, Any]:
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
-    try:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Imagem inválida: {exc}") from exc
-
+    pil_img = await _read_image(file)
     bundle, _ = get_model_state()
     return predict_rgb_array(np.asarray(pil_img), bundle, hint_species=hint_species)
+
+
+@app.post("/predict/batch")
+async def predict_batch_endpoint(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    """Classifica os recortes na ordem em que foram enviados."""
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(status_code=413, detail="O lote pode ter no máximo 32 arquivos.")
+    if any(file.size is not None and file.size > MAX_BATCH_FILE_BYTES for file in files):
+        raise HTTPException(status_code=413, detail="Cada arquivo pode ter no máximo 15 MiB.")
+
+    bundle, _ = get_model_state()
+    predictions = []
+    for file in files:
+        pil_img = await _read_image(file, MAX_BATCH_FILE_BYTES)
+        predictions.append(predict_rgb_array(np.asarray(pil_img), bundle))
+    return {"predictions": predictions}
 
 
 @app.post("/contribute")
@@ -327,21 +352,13 @@ async def contribute_endpoint(
     notes: str = Form(default=""),
 ) -> dict[str, Any]:
     """Salva foto enviada por usuário + metadados no storage configurado (Local, AWS S3 ou GCS)."""
-    raw_bytes = await file.read()
-    if not raw_bytes:
-        raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
-    try:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
-        ok_quality, reason, quality_metrics = validate_image_quality(pil_img)
-        if not ok_quality:
-            raise HTTPException(status_code=422, detail=reason)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=92)
-        clean_jpeg = buf.getvalue()
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Imagem inválida: {exc}") from exc
+    pil_img = await _read_image(file)
+    ok_quality, reason, quality_metrics = validate_image_quality(pil_img)
+    if not ok_quality:
+        raise HTTPException(status_code=422, detail=reason)
+    pil_img.info.clear()
+    buf = io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=92)
 
     metadata = {
         "predicted_scientific": predicted_scientific,
@@ -356,6 +373,11 @@ async def contribute_endpoint(
         "consent_research": True,
     }
     try:
-        return save_contribution(clean_jpeg, metadata)
+        return await run_in_threadpool(save_contribution, buf.getvalue(), metadata)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar contribuição: {exc}") from exc
+
+
+@app.get("/contributions/stats")
+def contributions_stats() -> dict[str, Any]:
+    return get_contribution_stats()

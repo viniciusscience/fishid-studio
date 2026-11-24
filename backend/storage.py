@@ -8,17 +8,21 @@ Troque o destino apenas alterando variáveis de ambiente no .env:
 """
 from __future__ import annotations
 
-import io
+import hashlib
 import json
 import os
 import re
 import uuid
+from collections import Counter
+from collections.abc import Callable, Iterator
+from contextlib import ExitStack, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
+from filelock import FileLock
 from PIL import Image
 
 
@@ -84,38 +88,138 @@ def get_storage_config() -> dict[str, Any]:
     }
 
 
-def save_contribution(
+def _target_species(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("user_suggested_species") or metadata.get("predicted_scientific") or "nova_especie")
+
+
+def _manifest_rows(path: Path) -> Iterator[dict[str, Any]]:
+    try:
+        manifest = path.open("rb")
+    except FileNotFoundError:
+        return
+    with manifest:
+        for line in manifest:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(entry, dict):
+                yield entry
+
+
+def _append_manifest(path: Path, entry: dict[str, Any]) -> None:
+    with path.open("a+b") as manifest:
+        offset = manifest.tell()
+        separator = b""
+        if offset:
+            manifest.seek(-1, os.SEEK_END)
+            if manifest.read(1) != b"\n":
+                separator = b"\n"
+        row = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        try:
+            manifest.write(separator + row + b"\n")
+            manifest.flush()
+        except OSError:
+            manifest.truncate(offset)
+            raise
+
+
+def _discard_cloud_object(delete: Callable[..., Any], **kwargs: Any) -> None:
+    # O rollback em nuvem depende da permissão de exclusão do bucket.
+    with suppress(Exception):
+        delete(**kwargs)
+
+
+def get_contribution_stats() -> dict[str, Any]:
+    cfg = get_storage_config()
+    manifest_path = Path(cfg["local_dir"]) / cfg["prefix"] / "manifest.jsonl"
+    confirmed = needs_review = 0
+    by_species: Counter[str] = Counter()
+    for entry in _manifest_rows(manifest_path):
+        by_species[_target_species(entry)] += 1
+        if entry.get("user_confirmed"):
+            confirmed += 1
+        else:
+            needs_review += 1
+    return {
+        "total_samples": confirmed + needs_review,
+        "confirmed": confirmed,
+        "needs_review": needs_review,
+        "by_species": dict(by_species),
+    }
+
+
+def save_contribution(image_bytes: bytes, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Armazena uma única cópia de cada JPEG e mantém um manifesto local."""
+    cfg = get_storage_config()
+    base_dir = Path(cfg["local_dir"])
+    manifest_path = base_dir / cfg["prefix"] / "manifest.jsonl"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    image_hash = hashlib.sha256(image_bytes).hexdigest()
+    with FileLock(f"{manifest_path}.lock"):
+        for entry in _manifest_rows(manifest_path):
+            stored_hash = entry.get("sha256")
+            # Contribuições locais antigas registram o caminho, mas não o hash.
+            if not stored_hash and entry.get("image_key"):
+                try:
+                    stored_hash = hashlib.sha256((base_dir / entry["image_key"]).read_bytes()).hexdigest()
+                except FileNotFoundError:
+                    continue
+            if stored_hash == image_hash:
+                return {
+                    "saved": True,
+                    "duplicate": True,
+                    "backend": entry.get("storage_backend", "local") if entry.get("location") else "local",
+                    "sample_id": entry["sample_id"],
+                    "location": entry.get("location") or str(base_dir / entry["image_key"]),
+                }
+
+        with ExitStack() as cleanup:
+            entry = _store_contribution(cfg, image_bytes, {**metadata, "sha256": image_hash}, cleanup)
+            _append_manifest(manifest_path, entry)
+            cleanup.pop_all()
+        return {
+            "saved": True,
+            "backend": entry["storage_backend"],
+            "sample_id": entry["sample_id"],
+            "location": entry["location"],
+        }
+
+
+def _store_contribution(
+    cfg: dict[str, Any],
     image_bytes: bytes,
     metadata: dict[str, Any],
+    cleanup: ExitStack,
 ) -> dict[str, Any]:
-    """Armazena imagem + metadados JSON no destino configurado por variável de ambiente."""
-    cfg = get_storage_config()
     sample_id = uuid.uuid4().hex[:12]
     ts = datetime.now(timezone.utc)
     date_part = ts.strftime("%Y%m%d")
 
-    target_species = (
-        metadata.get("user_suggested_species")
-        or metadata.get("predicted_scientific")
-        or "nova_especie"
-    )
-    folder_species = _slugify(str(target_species))
+    folder_species = _slugify(_target_species(metadata))
     review_bucket = "confirmed" if metadata.get("user_confirmed") else "needs_review"
 
-    rel_img_key = f"{cfg['prefix']}/{review_bucket}/{folder_species}/{date_part}_{sample_id}.jpg"
-    rel_meta_key = f"{cfg['prefix']}/{review_bucket}/{folder_species}/{date_part}_{sample_id}.json"
+    prefix = f"{cfg['prefix']}/" if cfg["prefix"] else ""
+    sample_key = f"{prefix}{review_bucket}/{folder_species}/{date_part}_{sample_id}"
+    rel_img_key, rel_meta_key = f"{sample_key}.jpg", f"{sample_key}.json"
+    backend = cfg["backend"] if cfg["backend"] in {"s3", "gcs"} else "local"
+    base_dir = Path(cfg["local_dir"])
+    img_path = base_dir / rel_img_key
+    scheme = "gs" if backend == "gcs" else backend
+    location = str(img_path) if backend == "local" else f"{scheme}://{cfg['bucket']}/{rel_img_key}"
 
     enriched_meta = {
+        **metadata,
         "sample_id": sample_id,
         "timestamp_utc": ts.isoformat(),
-        "storage_backend": cfg["backend"],
+        "storage_backend": backend,
         "image_key": rel_img_key,
-        **metadata,
+        "location": location,
     }
     meta_bytes = json.dumps(enriched_meta, ensure_ascii=False, indent=2).encode("utf-8")
 
     # 1. AWS S3 / Compatível (R2, MinIO)
-    if cfg["backend"] == "s3":
+    if backend == "s3":
         if not cfg["bucket"]:
             raise RuntimeError("STORAGE_BACKEND=s3 exige STORAGE_BUCKET definido no .env.")
         import boto3
@@ -125,58 +229,42 @@ def save_contribution(
             region_name=cfg["aws_region"],
             endpoint_url=cfg["s3_endpoint_url"],
         )
+        cleanup.callback(_discard_cloud_object, client.delete_object, Bucket=cfg["bucket"], Key=rel_img_key)
         client.put_object(
             Bucket=cfg["bucket"],
             Key=rel_img_key,
             Body=image_bytes,
             ContentType="image/jpeg",
         )
+        cleanup.callback(_discard_cloud_object, client.delete_object, Bucket=cfg["bucket"], Key=rel_meta_key)
         client.put_object(
             Bucket=cfg["bucket"],
             Key=rel_meta_key,
             Body=meta_bytes,
             ContentType="application/json; charset=utf-8",
         )
-        return {
-            "saved": True,
-            "backend": "s3",
-            "sample_id": sample_id,
-            "location": f"s3://{cfg['bucket']}/{rel_img_key}",
-        }
 
     # 2. Google Cloud Storage (GCS)
-    if cfg["backend"] == "gcs":
+    elif backend == "gcs":
         if not cfg["bucket"]:
             raise RuntimeError("STORAGE_BACKEND=gcs exige STORAGE_BUCKET definido no .env.")
         from google.cloud import storage
 
         client = storage.Client(project=cfg["gcs_project_id"])
         bucket = client.bucket(cfg["bucket"])
-        bucket.blob(rel_img_key).upload_from_string(image_bytes, content_type="image/jpeg")
-        bucket.blob(rel_meta_key).upload_from_string(meta_bytes, content_type="application/json")
-        return {
-            "saved": True,
-            "backend": "gcs",
-            "sample_id": sample_id,
-            "location": f"gs://{cfg['bucket']}/{rel_img_key}",
-        }
+        image_blob = bucket.blob(rel_img_key)
+        metadata_blob = bucket.blob(rel_meta_key)
+        cleanup.callback(_discard_cloud_object, image_blob.delete)
+        image_blob.upload_from_string(image_bytes, content_type="image/jpeg")
+        cleanup.callback(_discard_cloud_object, metadata_blob.delete)
+        metadata_blob.upload_from_string(meta_bytes, content_type="application/json")
 
     # 3. Armazenamento local (padrão para Docker / VPS)
-    base_dir = Path(cfg["local_dir"])
-    img_path = base_dir / rel_img_key
-    meta_path = base_dir / rel_meta_key
-    img_path.parent.mkdir(parents=True, exist_ok=True)
-    img_path.write_bytes(image_bytes)
-    meta_path.write_bytes(meta_bytes)
-
-    manifest_path = base_dir / cfg["prefix"] / "manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", encoding="utf-8") as mf:
-        mf.write(json.dumps(enriched_meta, ensure_ascii=False) + "\n")
-
-    return {
-        "saved": True,
-        "backend": "local",
-        "sample_id": sample_id,
-        "location": str(img_path),
-    }
+    else:
+        img_path.parent.mkdir(parents=True, exist_ok=True)
+        meta_path = base_dir / rel_meta_key
+        cleanup.callback(img_path.unlink, missing_ok=True)
+        img_path.write_bytes(image_bytes)
+        cleanup.callback(meta_path.unlink, missing_ok=True)
+        meta_path.write_bytes(meta_bytes)
+    return enriched_meta

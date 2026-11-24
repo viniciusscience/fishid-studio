@@ -8,3 +8,4 @@ pillow>=10.4.0
 numpy>=1.26.0
 boto3>=1.35.0
 google-cloud-storage>=2.18.0
+filelock>=3.16.0
