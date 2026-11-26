@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import os
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 
 from storage import get_storage_config, save_contribution, validate_image_quality
@@ -394,12 +395,38 @@ async def predict_endpoint(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
     try:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("RGB")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Imagem inválida: {exc}") from exc
 
     bundle, _ = get_model_state()
     return predict_rgb_array(np.asarray(pil_img), bundle, hint_species=hint_species)
+
+
+async def _read_prediction(file: UploadFile, bundle: dict[str, Any] | None) -> dict[str, Any]:
+    raw_bytes = await file.read()
+    if not raw_bytes:
+        raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
+    try:
+        pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Imagem inválida: {exc}") from exc
+    return predict_rgb_array(np.asarray(pil_img), bundle)
+
+
+@app.post("/predict/batch", response_model=None)
+async def predict_batch_endpoint(files: list[UploadFile] = File(...)) -> dict[str, Any]:
+    if len(files) > 32:
+        raise HTTPException(status_code=413, detail="Máximo de 32 arquivos por lote.")
+    bundle, _ = get_model_state()
+    results = []
+    for file in files:
+        raw = await file.read()
+        if len(raw) > 15 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Cada arquivo deve ter no máximo 15 MB.")
+        file.file.seek(0)
+        results.append(await _read_prediction(file, bundle))
+    return {"count": len(results), "predictions": results}
 
 
 @app.post(
@@ -425,7 +452,7 @@ async def contribute_endpoint(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
     try:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_img = ImageOps.exif_transpose(Image.open(io.BytesIO(raw_bytes))).convert("RGB")
         ok_quality, reason, quality_metrics = validate_image_quality(pil_img)
         if not ok_quality:
             raise HTTPException(status_code=422, detail=reason)
@@ -453,3 +480,24 @@ async def contribute_endpoint(
         return save_contribution(clean_jpeg, metadata)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar contribuição: {exc}") from exc
+
+
+@app.get("/contributions/stats", response_model=None)
+def contribution_stats() -> dict[str, Any]:
+    cfg = get_storage_config()
+    manifest = Path(cfg["local_dir"]) / cfg["prefix"] / "manifest.jsonl"
+    total = confirmed = needs_review = 0
+    species: dict[str, int] = {}
+    if manifest.is_file():
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            total += 1
+            if item.get("user_confirmed"):
+                confirmed += 1
+            else:
+                needs_review += 1
+            name = item.get("predicted_scientific") or item.get("user_suggested_species") or "desconhecida"
+            species[name] = species.get(name, 0) + 1
+    return {"total_samples": total, "confirmed": confirmed, "needs_review": needs_review, "species": species}
