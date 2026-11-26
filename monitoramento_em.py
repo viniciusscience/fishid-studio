@@ -196,11 +196,14 @@ def _classify_crop_via_fishid_api(api_base: str, crop_path: Path) -> tuple[str, 
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+        name = data.get("display_name") or data.get("top_species") or data.get("scientific_name")
+        if name:
+            return str(name), round(float(data.get("confidence", 0.0)), 4)
+
         top = data.get("top_prediction") or {}
         name = top.get("display_name") or top.get("common_pt") or top.get("species")
-        conf = float(top.get("confidence", 0.0))
         if name:
-            return str(name), round(conf, 4)
+            return str(name), round(float(top.get("confidence", 0.0)), 4)
     except Exception:
         return None
     return None
