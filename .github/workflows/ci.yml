@@ -1,17 +1,13 @@
 name: CI
 
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+on: [push, pull_request]
 
 permissions:
   contents: read
 
 jobs:
   syntax-and-tests:
-    name: Python Syntax, Smoke Check & Tests
+    name: Python Syntax, Lint, Smoke Check & Tests
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -25,6 +21,7 @@ jobs:
           cache-dependency-path: |
             backend/requirements.txt
             frontend/requirements.txt
+            requirements-test.txt
 
       - name: Check Python syntax across all scripts and services
         run: |
@@ -49,17 +46,10 @@ jobs:
       - name: Install runtime & test dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install \
-            pytest \
-            httpx \
-            fastapi \
-            python-multipart \
-            opencv-python-headless \
-            pillow \
-            numpy \
-            pandas \
-            "streamlit>=1.40.0" \
-            tqdm
+          python -m pip install -r requirements-test.txt
+
+      - name: Lint Python services, scripts and tests
+        run: ruff check .
 
       - name: Smoke-test backend API and core modules
         run: |
@@ -77,10 +67,5 @@ jobs:
           print('Backend & core module smoke check passed!')
           "
 
-      - name: Run pytest suite (if test files exist)
-        run: |
-          if find . -maxdepth 3 -name "test_*.py" -o -name "*_test.py" | grep -q .; then
-            pytest -v
-          else
-            echo "No pytest files yet — skipping pytest step."
-          fi
+      - name: Run pytest suite
+        run: pytest -v

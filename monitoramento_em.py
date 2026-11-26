@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import argparse
 import csv
+import http.client
 import json
+import math
 import subprocess
 import time
 import urllib.request
@@ -178,31 +180,45 @@ def _infer_fish_group(obs_list: list[dict]) -> tuple[str, float]:
 
 def _classify_crop_via_fishid_api(api_base: str, crop_path: Path) -> tuple[str, float] | None:
     """Consulta opcional à API FastAPI do FishID Studio (ConvNeXt-Tiny) para espécie científica."""
-    url = api_base.rstrip("/") + "/predict"
-    boundary = "----FishIDBoundary7MA4YWxkTrZu0gW"
-    img_bytes = crop_path.read_bytes()
-    body = (
-        f"--{boundary}\r\n"
-        f'Content-Disposition: form-data; name="file"; filename="{crop_path.name}"\r\n'
-        f"Content-Type: image/jpeg\r\n\r\n"
-    ).encode("utf-8") + img_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
-
-    req = urllib.request.Request(
-        url,
-        data=body,
-        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-        method="POST",
-    )
     try:
+        url = api_base.rstrip("/") + "/predict"
+        boundary = "----FishIDBoundary7MA4YWxkTrZu0gW"
+        img_bytes = crop_path.read_bytes()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{crop_path.name}"\r\n'
+            f"Content-Type: image/jpeg\r\n\r\n"
+        ).encode("utf-8") + img_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        top = data.get("top_prediction") or {}
-        name = top.get("display_name") or top.get("common_pt") or top.get("species")
-        conf = float(top.get("confidence", 0.0))
-        if name:
-            return str(name), round(conf, 4)
-    except Exception:
-        return None
+        if not isinstance(data, dict):
+            raise ValueError("FishID prediction must be an object")
+        # /predict exposes the winning species at the response root, not in
+        # top_prediction. Prefer the translated display label when available.
+        name = next(
+            (
+                value.strip()
+                for key in ("display_name", "top_species", "scientific_name")
+                if isinstance(value := data.get(key), str) and value.strip()
+            ),
+            None,
+        )
+        confidence = data.get("confidence")
+        if name is None or isinstance(confidence, bool):
+            raise ValueError("FishID prediction has no valid label or confidence")
+        conf = float(confidence)
+        if not math.isfinite(conf) or not 0.0 <= conf <= 1.0:
+            raise ValueError("FishID confidence must be a probability")
+        return name, round(conf, 4)
+    except (OSError, ValueError, TypeError, http.client.HTTPException):
+        print("[WARN] API FishID indisponivel ou resposta invalida; classificacao ignorada.")
     return None
 
 
@@ -578,7 +594,6 @@ def save_audit_card(
         f"Individuo #{event_id} | Classe: {fish_label} ({label_conf*100:.0f}%) | "
         f"Tamanho medio: {size_str} | Frame {frame_idx} ({_fmt_hms(tempo_s)})"
     )
-    tids_txt = ",".join(f"#{t}" for t in track_ids[:6]) + ("..." if len(track_ids) > 6 else "")
     sub = (
         f"Curva frame: {meas['comprimento_curva_px']:.1f} px | Eixo: {meas['comprimento_eixo_px']:.1f} px | "
         f"Aspecto: {meas['razao_aspecto']:.2f} | Oclusao: {person_overlap*100:.0f}%"

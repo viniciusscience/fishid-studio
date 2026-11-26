@@ -8,11 +8,14 @@ Troque o destino apenas alterando variáveis de ambiente no .env:
 """
 from __future__ import annotations
 
-import io
+import hashlib
 import json
 import os
 import re
+import tempfile
+import threading
 import uuid
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -20,6 +23,9 @@ from typing import Any
 import cv2
 import numpy as np
 from PIL import Image
+
+
+_CONTRIBUTION_LOCK = threading.RLock()
 
 
 def validate_image_quality(pil_img: Image.Image) -> tuple[bool, str, dict[str, float]]:
@@ -89,99 +95,183 @@ def get_storage_config() -> dict[str, Any]:
     }
 
 
-def save_contribution(
-    image_bytes: bytes,
-    metadata: dict[str, Any],
-) -> dict[str, Any]:
-    """Armazena imagem + metadados JSON no destino configurado por variável de ambiente."""
+def _manifest_path(cfg: dict[str, Any]) -> Path:
+    return Path(cfg["local_dir"]) / cfg["prefix"] / "manifest.jsonl"
+
+
+@contextmanager
+def _locked_manifest(manifest: Path):
+    """Serialize writers/readers on one host (threads and worker processes)."""
+    with _CONTRIBUTION_LOCK:
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        with (manifest.parent / ".manifest.lock").open("a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+
+                if lock.seek(0, os.SEEK_END) == 0:
+                    lock.write(b"\0")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _manifest_records(manifest: Path) -> list[dict[str, Any]]:
+    if not manifest.exists():
+        return []
+    records = []
+    with manifest.open(encoding="utf-8") as source:
+        for line in source:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                # Older append-only manifests may contain a truncated last line.
+                continue
+            if (isinstance(record, dict) and isinstance(record.get("sample_id"), str)
+                    and isinstance(record.get("image_key"), str)):
+                records.append(record)
+    return records
+
+
+def _append_manifest(manifest: Path, record: dict[str, Any]) -> None:
+    """Publish a complete JSONL file; a failed write leaves the old index intact."""
+    previous = manifest.read_bytes() if manifest.exists() else b""
+    if previous and not previous.endswith(b"\n"):
+        previous += b"\n"
+    row = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=manifest.parent, prefix=".manifest-", delete=False) as out:
+            temporary = Path(out.name)
+            out.write(previous)
+            out.write(row)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, manifest)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _destination(cfg: dict[str, Any]) -> str:
+    backend = cfg["backend"]
+    if backend == "s3":
+        parts = [backend, cfg["bucket"], cfg["prefix"], cfg["s3_endpoint_url"]]
+    elif backend == "gcs":
+        parts = [backend, cfg["bucket"], cfg["prefix"], cfg["gcs_project_id"]]
+    else:
+        parts = ["local", str((Path(cfg["local_dir"]) / cfg["prefix"]).resolve())]
+    return json.dumps(parts, ensure_ascii=False)
+
+
+def _target_species(metadata: dict[str, Any]) -> str:
+    return str(metadata.get("user_suggested_species") or metadata.get("predicted_scientific") or "nova_especie")
+
+
+def get_contribution_stats() -> dict[str, Any]:
+    """Count the current destination in this installation's local manifest.
+
+    This does not list remote buckets or contributions indexed by another host.
+    Legacy rows without destination/hash remain included for compatibility;
+    malformed rows are skipped. The manifest is the source of truth, not a
+    check that previously saved objects still exist.
+    """
     cfg = get_storage_config()
-    sample_id = uuid.uuid4().hex[:12]
-    ts = datetime.now(timezone.utc)
-    date_part = ts.strftime("%Y%m%d")
+    manifest = _manifest_path(cfg)
+    destination = _destination(cfg)
+    stats: dict[str, Any] = {"total": 0, "confirmed": 0, "needs_review": 0, "by_species": {}}
+    if not manifest.exists():
+        return stats
+    with _locked_manifest(manifest):
+        records = _manifest_records(manifest)
+    for record in records:
+        if record.get("storage_destination") not in (None, destination):
+            continue
+        review = "confirmed" if record.get("user_confirmed") else "needs_review"
+        species = _target_species(record)
+        stats["total"] += 1
+        stats[review] += 1
+        stats["by_species"][species] = stats["by_species"].get(species, 0) + 1
+    return stats
 
-    target_species = (
-        metadata.get("user_suggested_species")
-        or metadata.get("predicted_scientific")
-        or "nova_especie"
-    )
-    folder_species = _slugify(str(target_species))
-    review_bucket = "confirmed" if metadata.get("user_confirmed") else "needs_review"
 
-    rel_img_key = f"{cfg['prefix']}/{review_bucket}/{folder_species}/{date_part}_{sample_id}.jpg"
-    rel_meta_key = f"{cfg['prefix']}/{review_bucket}/{folder_species}/{date_part}_{sample_id}.json"
+def save_contribution(image_bytes: bytes, metadata: dict[str, Any]) -> dict[str, Any]:
+    """Save once per SHA256/destination; duplicates retain the first metadata.
 
-    enriched_meta = {
-        "sample_id": sample_id,
-        "timestamp_utc": ts.isoformat(),
-        "storage_backend": cfg["backend"],
-        "image_key": rel_img_key,
-        **metadata,
-    }
-    meta_bytes = json.dumps(enriched_meta, ensure_ascii=False, indent=2).encode("utf-8")
+    The local manifest indexes successful saves for every backend. Its lock
+    coordinates workers sharing this index, not independent hosts. Cloud
+    rollback is best effort if an upload or index write fails.
+    """
+    cfg = get_storage_config()
+    backend = cfg["backend"] if cfg["backend"] in {"s3", "gcs"} else "local"
+    if backend in {"s3", "gcs"} and not cfg["bucket"]:
+        raise RuntimeError(f"STORAGE_BACKEND={backend} exige STORAGE_BUCKET definido no .env.")
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    destination = _destination(cfg)
+    manifest = _manifest_path(cfg)
+    with _locked_manifest(manifest):
+        for record in _manifest_records(manifest):
+            if (record.get("image_sha256") == digest
+                    and record.get("storage_destination") == destination
+                    and isinstance(record.get("location"), str)):
+                return {"saved": True, "duplicate": True, "backend": backend,
+                        "sample_id": record["sample_id"], "location": record["location"]}
 
-    # 1. AWS S3 / Compatível (R2, MinIO)
-    if cfg["backend"] == "s3":
-        if not cfg["bucket"]:
-            raise RuntimeError("STORAGE_BACKEND=s3 exige STORAGE_BUCKET definido no .env.")
-        import boto3
+        sample_id = uuid.uuid4().hex[:12]
+        ts = datetime.now(timezone.utc)
+        review = "confirmed" if metadata.get("user_confirmed") else "needs_review"
+        stem = f"{review}/{_slugify(_target_species(metadata))}/{ts:%Y%m%d}_{sample_id}"
+        rel_img_key = "/".join(part for part in (cfg["prefix"], stem + ".jpg") if part)
+        rel_meta_key = "/".join(part for part in (cfg["prefix"], stem + ".json") if part)
+        img_path = Path(cfg["local_dir"]) / rel_img_key
+        location = (f"s3://{cfg['bucket']}/{rel_img_key}" if backend == "s3" else
+                    f"gs://{cfg['bucket']}/{rel_img_key}" if backend == "gcs" else str(img_path))
+        # Internal identity fields always win over caller-supplied metadata.
+        enriched_meta = {**metadata, "sample_id": sample_id, "timestamp_utc": ts.isoformat(),
+                         "storage_backend": backend, "storage_destination": destination,
+                         "image_key": rel_img_key, "image_sha256": digest, "location": location}
+        meta_bytes = json.dumps(enriched_meta, ensure_ascii=False, indent=2).encode("utf-8")
+        cleanup = []
+        try:
+            if backend == "s3":
+                import boto3
 
-        client = boto3.client(
-            "s3",
-            region_name=cfg["aws_region"],
-            endpoint_url=cfg["s3_endpoint_url"],
-        )
-        client.put_object(
-            Bucket=cfg["bucket"],
-            Key=rel_img_key,
-            Body=image_bytes,
-            ContentType="image/jpeg",
-        )
-        client.put_object(
-            Bucket=cfg["bucket"],
-            Key=rel_meta_key,
-            Body=meta_bytes,
-            ContentType="application/json; charset=utf-8",
-        )
-        return {
-            "saved": True,
-            "backend": "s3",
-            "sample_id": sample_id,
-            "location": f"s3://{cfg['bucket']}/{rel_img_key}",
-        }
+                client = boto3.client("s3", region_name=cfg["aws_region"], endpoint_url=cfg["s3_endpoint_url"])
+                for key, body, mime in ((rel_img_key, image_bytes, "image/jpeg"),
+                                        (rel_meta_key, meta_bytes, "application/json; charset=utf-8")):
+                    cleanup.append(lambda key=key: client.delete_object(Bucket=cfg["bucket"], Key=key))
+                    client.put_object(Bucket=cfg["bucket"], Key=key, Body=body, ContentType=mime)
+            elif backend == "gcs":
+                from google.cloud import storage
 
-    # 2. Google Cloud Storage (GCS)
-    if cfg["backend"] == "gcs":
-        if not cfg["bucket"]:
-            raise RuntimeError("STORAGE_BACKEND=gcs exige STORAGE_BUCKET definido no .env.")
-        from google.cloud import storage
-
-        client = storage.Client(project=cfg["gcs_project_id"])
-        bucket = client.bucket(cfg["bucket"])
-        bucket.blob(rel_img_key).upload_from_string(image_bytes, content_type="image/jpeg")
-        bucket.blob(rel_meta_key).upload_from_string(meta_bytes, content_type="application/json")
-        return {
-            "saved": True,
-            "backend": "gcs",
-            "sample_id": sample_id,
-            "location": f"gs://{cfg['bucket']}/{rel_img_key}",
-        }
-
-    # 3. Armazenamento local (padrão para Docker / VPS)
-    base_dir = Path(cfg["local_dir"])
-    img_path = base_dir / rel_img_key
-    meta_path = base_dir / rel_meta_key
-    img_path.parent.mkdir(parents=True, exist_ok=True)
-    img_path.write_bytes(image_bytes)
-    meta_path.write_bytes(meta_bytes)
-
-    manifest_path = base_dir / cfg["prefix"] / "manifest.jsonl"
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
-    with manifest_path.open("a", encoding="utf-8") as mf:
-        mf.write(json.dumps(enriched_meta, ensure_ascii=False) + "\n")
-
-    return {
-        "saved": True,
-        "backend": "local",
-        "sample_id": sample_id,
-        "location": str(img_path),
-    }
+                bucket = storage.Client(project=cfg["gcs_project_id"]).bucket(cfg["bucket"])
+                for key, body, mime in ((rel_img_key, image_bytes, "image/jpeg"),
+                                        (rel_meta_key, meta_bytes, "application/json")):
+                    blob = bucket.blob(key)
+                    cleanup.append(blob.delete)
+                    blob.upload_from_string(body, content_type=mime)
+            else:
+                meta_path = Path(cfg["local_dir"]) / rel_meta_key
+                img_path.parent.mkdir(parents=True, exist_ok=True)
+                for path, body in ((img_path, image_bytes), (meta_path, meta_bytes)):
+                    cleanup.append(lambda path=path: path.unlink(missing_ok=True))
+                    path.write_bytes(body)
+            _append_manifest(manifest, enriched_meta)
+        except Exception:
+            for undo in reversed(cleanup):
+                with suppress(Exception):
+                    undo()
+            raise
+        return {"saved": True, "duplicate": False, "backend": backend,
+                "sample_id": sample_id, "location": location}

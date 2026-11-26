@@ -33,6 +33,8 @@
 
 **FishID Studio** is an open-source computer vision platform for **automated identification, counting, and curved-body biometrics of large migratory pelagic fish** from photos, mobile cameras, and onboard fishing vessel videos. Born as a Master's thesis in Applied Computing at **UNIVALI / LEMA**, it combines scientific rigor (*ConvNeXt-Tiny*, *Grad-CAM* explainability, *YOLO-World + SAM 2.1* auto-segmentation, and *ByteTrack* multi-object tracking) with a responsive **PixiJS v8 WebGL** interface designed for researchers, fisheries electronic monitoring (EM), and citizen science.
 
+API guide: [batch predictions, image privacy, duplicate contributions and statistics](docs/api-contributions.md).
+
 ---
 
 ## 🐟 Real-Time Automated Species Classification
