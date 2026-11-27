@@ -149,7 +149,7 @@ def main() -> None:
             status = "OK" if proc.returncode == 0 else f"ERRO({proc.returncode})"
             results_summary.append((tag, desc, status))
     else:
-        results_summary = [(tag, desc, "OK") for tag, desc, _ in EXPERIMENTS]
+        results_summary = [(tag, desc, "OK") for tag, desc, _ in selected]
 
     # Gera tabela comparativa consolidada a partir do indice_experimentos.csv
     idx_path = EXP_ROOT / "indice_experimentos.csv"

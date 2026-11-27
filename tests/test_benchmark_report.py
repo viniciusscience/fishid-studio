@@ -45,3 +45,34 @@ def test_report_only_exports_same_mean_error_as_markdown(tmp_path, monkeypatch):
     assert records[0]["erro_medio_pct"] == 5.0
     assert records[1]["erro_medio_pct"] is None
     assert "±5.0%" in (tmp_path / "comparativo_10_experimentos.md").read_text(encoding="utf-8")
+
+
+def test_report_only_respects_only_filter(tmp_path, monkeypatch):
+    first_tag, _, _ = benchmark.EXPERIMENTS[0]
+    selected_tag, selected_desc, _ = benchmark.EXPERIMENTS[1]
+    run_first = tmp_path / ("latest_" + first_tag)
+    run_selected = tmp_path / ("latest_" + selected_tag)
+    run_first.mkdir()
+    run_selected.mkdir()
+    pd.DataFrame([
+        {
+            "run_id": run_first.name, "pasta": str(run_first), "frames_processados": 30,
+            "peixes_contados": 2, "comprimento_mediano_px": 120.5, "tempo_execucao_s": 2.1,
+        },
+        {
+            "run_id": run_selected.name, "pasta": str(run_selected), "frames_processados": 45,
+            "peixes_contados": 3, "comprimento_mediano_px": 135.0, "tempo_execucao_s": 3.4,
+        },
+    ]).to_csv(tmp_path / "indice_experimentos.csv", index=False)
+    output = tmp_path / "comparativo.json"
+    monkeypatch.setattr(benchmark, "EXP_ROOT", tmp_path)
+    monkeypatch.setattr(
+        sys, "argv", ["benchmark", "--report-only", "--only", selected_tag, "--json-out", str(output)]
+    )
+    benchmark.main()
+    records = json.loads(output.read_text(encoding="utf-8"))
+    assert [r["tag"] for r in records] == [selected_tag]
+    assert records[0]["description"] == selected_desc
+    md_text = (tmp_path / "comparativo_10_experimentos.md").read_text(encoding="utf-8")
+    assert f"`{selected_tag}`" in md_text
+    assert f"`{first_tag}`" not in md_text
