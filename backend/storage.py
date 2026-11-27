@@ -8,6 +8,7 @@ Troque o destino apenas alterando variáveis de ambiente no .env:
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -96,6 +97,7 @@ def save_contribution(
     """Armazena imagem + metadados JSON no destino configurado por variável de ambiente."""
     cfg = get_storage_config()
     sample_id = uuid.uuid4().hex[:12]
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
     ts = datetime.now(timezone.utc)
     date_part = ts.strftime("%Y%m%d")
 
@@ -112,12 +114,26 @@ def save_contribution(
 
     enriched_meta = {
         "sample_id": sample_id,
+        "image_sha256": image_sha256,
         "timestamp_utc": ts.isoformat(),
         "storage_backend": cfg["backend"],
         "image_key": rel_img_key,
         **metadata,
     }
     meta_bytes = json.dumps(enriched_meta, ensure_ascii=False, indent=2).encode("utf-8")
+
+    if cfg["backend"] == "local":
+        manifest_path = Path(cfg["local_dir"]) / cfg["prefix"] / "manifest.jsonl"
+        if manifest_path.is_file():
+            for line in manifest_path.read_text(encoding="utf-8").splitlines():
+                if line.strip() and json.loads(line).get("image_sha256") == image_sha256:
+                    existing = json.loads(line)
+                    return {
+                        "saved": False,
+                        "backend": "local",
+                        "sample_id": existing["sample_id"],
+                        "location": existing["image_key"],
+                    }
 
     # 1. AWS S3 / Compatível (R2, MinIO)
     if cfg["backend"] == "s3":

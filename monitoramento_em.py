@@ -204,9 +204,8 @@ def _classify_crop_via_fishid_api(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        top = data.get("top_prediction") or {}
-        name = top.get("display_name") or top.get("common_pt") or top.get("species")
-        conf = float(top.get("confidence", 0.0))
+        name = data.get("display_name") or data.get("top_species") or data.get("scientific_name")
+        conf = float(data.get("confidence", 0.0))
         if name:
             return str(name), round(conf, 4)
     except Exception as exc:
