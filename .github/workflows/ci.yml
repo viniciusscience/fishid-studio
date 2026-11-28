@@ -51,6 +51,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install \
             pytest \
+            ruff \
             httpx \
             fastapi \
             python-multipart \
@@ -60,6 +61,17 @@ jobs:
             pandas \
             "streamlit>=1.40.0" \
             tqdm
+
+      - name: Run ruff lint check
+        run: |
+          ruff check --select E4,E7,E9,F \
+            backend \
+            frontend \
+            tests \
+            monitoramento_em.py \
+            rodar_suite_benchmark.py \
+            rastrear_peixes_auto.py \
+            segmentar_peixes_auto.py
 
       - name: Smoke-test backend API and core modules
         run: |
@@ -77,10 +89,5 @@ jobs:
           print('Backend & core module smoke check passed!')
           "
 
-      - name: Run pytest suite (if test files exist)
-        run: |
-          if find . -maxdepth 3 -name "test_*.py" -o -name "*_test.py" | grep -q .; then
-            pytest -v
-          else
-            echo "No pytest files yet — skipping pytest step."
-          fi
+      - name: Run pytest suite
+        run: pytest -v

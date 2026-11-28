@@ -204,13 +204,27 @@ def _classify_crop_via_fishid_api(
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-        top = data.get("top_prediction") or {}
-        name = top.get("display_name") or top.get("common_pt") or top.get("species")
-        conf = float(top.get("confidence", 0.0))
+        if not isinstance(data, dict):
+            return None
+        top = data.get("top_prediction")
+        nested = top if isinstance(top, dict) else {}
+        name = (
+            data.get("display_name")
+            or data.get("top_species")
+            or data.get("scientific_name")
+            or nested.get("display_name")
+            or nested.get("common_pt")
+            or nested.get("species")
+        )
+        raw_conf = data.get("confidence")
+        if raw_conf is None:
+            raw_conf = nested.get("confidence", 0.0)
+        conf = float(raw_conf)
         if name:
             return str(name), round(conf, 4)
     except Exception as exc:
-        print(f"[WARN] FishID API request failed ({url}): {exc}")
+        reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
+        print(f"[WARN] FishID API offline ({url}): {reason}")
         return None
     return None
 
@@ -594,7 +608,6 @@ def save_audit_card(
         f"Individuo #{event_id} | Classe: {fish_label} ({label_conf*100:.0f}%) | "
         f"Tamanho medio: {size_str} | Frame {frame_idx} ({_fmt_hms(tempo_s)})"
     )
-    tids_txt = ",".join(f"#{t}" for t in track_ids[:6]) + ("..." if len(track_ids) > 6 else "")
     sub = (
         f"Curva frame: {meas['comprimento_curva_px']:.1f} px | Eixo: {meas['comprimento_eixo_px']:.1f} px | "
         f"Aspecto: {meas['razao_aspecto']:.2f} | Oclusao: {person_overlap*100:.0f}%"

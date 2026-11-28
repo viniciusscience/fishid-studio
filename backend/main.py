@@ -11,10 +11,15 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
+from PIL import Image, ImageOps
 from pydantic import BaseModel
 
-from storage import get_storage_config, save_contribution, validate_image_quality
+from storage import (
+    get_contribution_stats,
+    get_storage_config,
+    save_contribution,
+    validate_image_quality,
+)
 
 # =============================================================================
 # Configurações editáveis do Backend (API Keras - FishID Studio)
@@ -23,6 +28,8 @@ MODEL_PATH: str = os.getenv("MODEL_PATH", "models/modelo.keras").strip()
 NORMALIZE_DIV_255: bool = os.getenv("NORMALIZE_DIV_255", "true").lower() == "true"
 PRESERVE_ASPECT_RATIO: bool = os.getenv("PRESERVE_ASPECT_RATIO", "true").lower() == "true"
 DEFAULT_INPUT_SIZE: tuple[int, int] = (320, 320)
+MAX_BATCH_FILES: int = 32
+MAX_BATCH_FILE_BYTES: int = 15 * 1024 * 1024  # 15 MB per file
 
 # Catálogo oficial das 10 espécies em ordem alfabética (mesma ordem do class_indices.json)
 SPECIES_CATALOG: list[dict[str, str]] = [
@@ -299,11 +306,44 @@ class PredictionResponse(BaseModel):
     probabilities: list[SpeciesProbability]
 
 
+class BatchPredictionItem(PredictionResponse):
+    filename: str
+
+
+class BatchPredictionResponse(BaseModel):
+    count: int
+    results: list[BatchPredictionItem]
+
+
 class ContributionResponse(BaseModel):
     saved: bool
+    duplicate: bool = False
     backend: str
     sample_id: str
     location: str
+    sha256: str = ""
+
+
+class ContributionStatsResponse(BaseModel):
+    total_samples: int
+    confirmed: int
+    needs_review: int
+    by_species: dict[str, int]
+
+
+def _open_rgb_image(raw_bytes: bytes) -> Image.Image:
+    """Abre imagem aplicando correção de orientação EXIF antes da conversão para RGB."""
+    with Image.open(io.BytesIO(raw_bytes)) as opened:
+        transposed = ImageOps.exif_transpose(opened)
+        return transposed.convert("RGB")
+
+
+def _encode_clean_jpeg(pil_img: Image.Image, quality: int = 92) -> bytes:
+    """Re-codifica somente os pixels RGB em JPEG sem tags EXIF (GPS/dispositivo)."""
+    pixel_only = Image.fromarray(np.asarray(pil_img, dtype=np.uint8), mode="RGB")
+    buf = io.BytesIO()
+    pixel_only.save(buf, format="JPEG", quality=quality)
+    return buf.getvalue()
 
 
 # Document the success bodies independently of response serialization.
@@ -394,7 +434,7 @@ async def predict_endpoint(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
     try:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_img = _open_rgb_image(raw_bytes)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Imagem inválida: {exc}") from exc
 
@@ -403,10 +443,52 @@ async def predict_endpoint(
 
 
 @app.post(
+    "/predict/batch",
+    tags=["Inference"],
+    summary="Classify multiple fish images in a batch",
+    description="Accepts up to 32 image uploads (max 15 MB per file) and returns ranked species predictions for each image.",
+    response_model=None,
+    responses={200: {"model": BatchPredictionResponse}},
+)
+async def predict_batch_endpoint(
+    files: list[UploadFile] = File(...),
+    hint_species: str | None = Form(default=None),
+) -> dict[str, Any]:
+    if not files:
+        raise HTTPException(status_code=400, detail="Nenhum arquivo de imagem enviado.")
+    if len(files) > MAX_BATCH_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Lote excede o máximo permitido de {MAX_BATCH_FILES} imagens.",
+        )
+
+    bundle, _ = get_model_state()
+    results: list[dict[str, Any]] = []
+    for idx, upload in enumerate(files):
+        fname = upload.filename or f"image_{idx}"
+        raw_bytes = await upload.read(MAX_BATCH_FILE_BYTES + 1)
+        if len(raw_bytes) > MAX_BATCH_FILE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Arquivo '{fname}' excede o limite máximo de 15 MB.",
+            )
+        if not raw_bytes:
+            raise HTTPException(status_code=400, detail=f"Arquivo de imagem vazio: {fname}")
+        try:
+            pil_img = _open_rgb_image(raw_bytes)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Imagem inválida ({fname}): {exc}") from exc
+        pred = predict_rgb_array(np.asarray(pil_img), bundle, hint_species=hint_species)
+        results.append({"filename": fname, **pred})
+
+    return {"count": len(results), "results": results}
+
+
+@app.post(
     "/contribute",
     tags=["Citizen Science"],
     summary="Submit a research image",
-    description="Checks the uploaded image quality and saves the image and submission metadata to the configured storage backend.",
+    description="Checks the uploaded image quality, normalizes orientation, strips EXIF metadata, and saves the image and submission metadata to the configured storage backend.",
     response_model=None,
     responses={200: {"model": ContributionResponse}},
 )
@@ -425,13 +507,11 @@ async def contribute_endpoint(
     if not raw_bytes:
         raise HTTPException(status_code=400, detail="Arquivo de imagem vazio.")
     try:
-        pil_img = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        pil_img = _open_rgb_image(raw_bytes)
         ok_quality, reason, quality_metrics = validate_image_quality(pil_img)
         if not ok_quality:
             raise HTTPException(status_code=422, detail=reason)
-        buf = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=92)
-        clean_jpeg = buf.getvalue()
+        clean_jpeg = _encode_clean_jpeg(pil_img, quality=92)
     except HTTPException:
         raise
     except Exception as exc:
@@ -453,3 +533,15 @@ async def contribute_endpoint(
         return save_contribution(clean_jpeg, metadata)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao salvar contribuição: {exc}") from exc
+
+
+@app.get(
+    "/contributions/stats",
+    tags=["Citizen Science"],
+    summary="Get citizen-science contribution statistics",
+    description="Reads manifest.jsonl and returns total samples, confirmed vs. needs_review counts, and per-species counts.",
+    response_model=None,
+    responses={200: {"model": ContributionStatsResponse}},
+)
+def contributions_stats_endpoint() -> dict[str, Any]:
+    return get_contribution_stats()

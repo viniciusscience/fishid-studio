@@ -8,7 +8,7 @@ Troque o destino apenas alterando variáveis de ambiente no .env:
 """
 from __future__ import annotations
 
-import io
+import hashlib
 import json
 import os
 import re
@@ -89,12 +89,90 @@ def get_storage_config() -> dict[str, Any]:
     }
 
 
+def _find_duplicate_in_manifest(manifest_path: Path, image_sha256: str) -> dict[str, Any] | None:
+    if not manifest_path.is_file():
+        return None
+    with manifest_path.open("r", encoding="utf-8") as mf:
+        for line in mf:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                record = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict) and record.get("sha256") == image_sha256:
+                return record
+    return None
+
+
+def get_contribution_stats() -> dict[str, Any]:
+    """Lê manifest.jsonl e agrega total de amostras, confirmadas vs. revisão e contagem por espécie."""
+    cfg = get_storage_config()
+    manifest_path = Path(cfg["local_dir"]) / cfg["prefix"] / "manifest.jsonl"
+
+    total_samples = 0
+    confirmed = 0
+    needs_review = 0
+    species_counts: dict[str, int] = {}
+
+    if manifest_path.is_file():
+        with manifest_path.open("r", encoding="utf-8") as mf:
+            for line in mf:
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                total_samples += 1
+                if record.get("user_confirmed"):
+                    confirmed += 1
+                else:
+                    needs_review += 1
+                species = str(
+                    record.get("user_suggested_species")
+                    or record.get("predicted_scientific")
+                    or "nova_especie"
+                ).strip() or "nova_especie"
+                species_counts[species] = species_counts.get(species, 0) + 1
+
+    ordered_species = dict(sorted(species_counts.items(), key=lambda kv: (-kv[1], kv[0])))
+    return {
+        "total_samples": total_samples,
+        "confirmed": confirmed,
+        "needs_review": needs_review,
+        "by_species": ordered_species,
+    }
+
+
 def save_contribution(
     image_bytes: bytes,
     metadata: dict[str, Any],
 ) -> dict[str, Any]:
     """Armazena imagem + metadados JSON no destino configurado por variável de ambiente."""
     cfg = get_storage_config()
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+
+    if cfg["backend"] == "local":
+        base_dir = Path(cfg["local_dir"])
+        manifest_path = base_dir / cfg["prefix"] / "manifest.jsonl"
+        existing = _find_duplicate_in_manifest(manifest_path, image_sha256)
+        if existing is not None:
+            existing_key = str(existing.get("image_key", ""))
+            existing_location = str(base_dir / existing_key) if existing_key else str(manifest_path)
+            return {
+                "saved": False,
+                "duplicate": True,
+                "backend": "local",
+                "sample_id": str(existing.get("sample_id", "")),
+                "location": existing_location,
+                "sha256": image_sha256,
+            }
+
     sample_id = uuid.uuid4().hex[:12]
     ts = datetime.now(timezone.utc)
     date_part = ts.strftime("%Y%m%d")
@@ -115,6 +193,7 @@ def save_contribution(
         "timestamp_utc": ts.isoformat(),
         "storage_backend": cfg["backend"],
         "image_key": rel_img_key,
+        "sha256": image_sha256,
         **metadata,
     }
     meta_bytes = json.dumps(enriched_meta, ensure_ascii=False, indent=2).encode("utf-8")
@@ -144,9 +223,11 @@ def save_contribution(
         )
         return {
             "saved": True,
+            "duplicate": False,
             "backend": "s3",
             "sample_id": sample_id,
             "location": f"s3://{cfg['bucket']}/{rel_img_key}",
+            "sha256": image_sha256,
         }
 
     # 2. Google Cloud Storage (GCS)
@@ -161,9 +242,11 @@ def save_contribution(
         bucket.blob(rel_meta_key).upload_from_string(meta_bytes, content_type="application/json")
         return {
             "saved": True,
+            "duplicate": False,
             "backend": "gcs",
             "sample_id": sample_id,
             "location": f"gs://{cfg['bucket']}/{rel_img_key}",
+            "sha256": image_sha256,
         }
 
     # 3. Armazenamento local (padrão para Docker / VPS)
@@ -181,7 +264,9 @@ def save_contribution(
 
     return {
         "saved": True,
+        "duplicate": False,
         "backend": "local",
         "sample_id": sample_id,
         "location": str(img_path),
+        "sha256": image_sha256,
     }
