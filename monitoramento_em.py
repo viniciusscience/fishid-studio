@@ -457,6 +457,27 @@ def consolidate_tracks(
     return filtered
 
 
+def should_accept_expanded_sam_mask(
+    area_box: int,
+    area_pt: int,
+    inter_with_box: int,
+    frame_area: int,
+) -> bool:
+    """Decide se a máscara expandida do SAM 2.1 via ponto interior deve ser aceita.
+
+    Critérios:
+    - overlap_box >= 0.70 (preserva coerência espacial com a detecção inicial da caixa)
+    - area_pt > area_box * 1.05 (expansão mínima de 5% sobre a área da caixa)
+    - area_pt <= min(area_box * 3.8, frame_area * 0.24) (limita vazamento e sobredimensionamento)
+    """
+    overlap_box = inter_with_box / max(1, area_box)
+    return (
+        area_pt > area_box * 1.05
+        and area_pt <= min(area_box * 3.8, frame_area * 0.24)
+        and overlap_box >= 0.70
+    )
+
+
 def segment_full_fish_sam2(
     sam,
     frame_bgr: np.ndarray,
@@ -503,13 +524,8 @@ def segment_full_fish_sam2(
     area_pt = int(np.count_nonzero(mask_pt > 127))
 
     inter_with_box = int(np.count_nonzero((mask_pt > 127) & (mask_box > 127)))
-    overlap_box = inter_with_box / max(1, area_box)
 
-    if (
-        area_pt > area_box * 1.05
-        and area_pt <= min(area_box * 3.8, frame_area * 0.24)
-        and overlap_box >= 0.70
-    ):
+    if should_accept_expanded_sam_mask(area_box, area_pt, inter_with_box, frame_area):
         return mask_pt, "ponto_expandido"
 
     return mask_box, "box"
